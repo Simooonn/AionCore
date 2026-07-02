@@ -15,7 +15,7 @@ use crate::types::PluginType;
 pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
     match platform {
         PluginType::Telegram => markdown_to_telegram_html(text),
-        PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
+        PluginType::Lark | PluginType::LarkIntl | PluginType::Dingtalk => html_to_markdown(text),
         PluginType::Slack => markdown_to_slack_mrkdwn(text),
         PluginType::Discord => text.to_string(),
         PluginType::Weixin => strip_html(text),

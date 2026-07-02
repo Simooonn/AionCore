@@ -15,7 +15,7 @@ use crate::types::{
     UnifiedAttachment, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
 };
 
-use super::api::LarkApi;
+use super::api::{FEISHU_DOMAIN, LARK_INTL_DOMAIN, LarkApi};
 use super::frame::{
     METHOD_CONTROL, METHOD_DATA, build_ack_frame, build_ping_frame, decode_frame, encode_frame, get_header,
 };
@@ -37,6 +37,10 @@ const DEDUP_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// card action triggers, and bot menu events. All responses use
 /// interactive cards (Lark only supports editing card messages).
 pub struct LarkPlugin {
+    /// Which Lark platform variant this instance serves (`Lark` or `LarkIntl`).
+    platform: PluginType,
+    /// Open platform base domain matching `platform`.
+    domain: &'static str,
     status: PluginStatus,
     bot_info: Option<BotInfo>,
     last_error: Option<String>,
@@ -52,6 +56,8 @@ pub struct LarkPlugin {
 impl Default for LarkPlugin {
     fn default() -> Self {
         Self {
+            platform: PluginType::Lark,
+            domain: FEISHU_DOMAIN,
             status: PluginStatus::Created,
             bot_info: None,
             last_error: None,
@@ -66,8 +72,18 @@ impl Default for LarkPlugin {
 }
 
 impl LarkPlugin {
+    /// Feishu (China) plugin instance.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lark international plugin instance (open.larksuite.com).
+    pub fn new_international() -> Self {
+        Self {
+            platform: PluginType::LarkIntl,
+            domain: LARK_INTL_DOMAIN,
+            ..Self::default()
+        }
     }
 }
 
@@ -107,7 +123,7 @@ impl ChannelPlugin for LarkPlugin {
                 ChannelError::ConnectionFailed(format!("HTTP client init failed: {e}"))
             })?;
 
-        let api = Arc::new(LarkApi::new(http_client, app_id, app_secret));
+        let api = Arc::new(LarkApi::new(http_client, app_id, app_secret, self.domain));
 
         // Validate credentials by getting bot info
         let bot_data = api.get_bot_info().await.map_err(|e| {
@@ -150,6 +166,7 @@ impl ChannelPlugin for LarkPlugin {
         let api_clone = Arc::clone(self.api.as_ref().expect("api set in initialize"));
         let dedup_cache = Arc::clone(&self.dedup_cache);
         self.ws_handle = Some(tokio::spawn(ws_loop(
+            self.platform,
             api_clone,
             callbacks.message_tx,
             callbacks.confirm_tx,
@@ -238,7 +255,7 @@ impl ChannelPlugin for LarkPlugin {
     }
 
     fn plugin_type(&self) -> PluginType {
-        PluginType::Lark
+        self.platform
     }
 
     fn status(&self) -> PluginStatus {
@@ -259,6 +276,7 @@ impl ChannelPlugin for LarkPlugin {
 /// On disconnect, implements exponential backoff reconnection up to
 /// `MAX_RECONNECT_ATTEMPTS`.
 async fn ws_loop(
+    platform: PluginType,
     api: Arc<LarkApi>,
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: mpsc::Sender<(String, String)>,
@@ -301,6 +319,7 @@ async fn ws_loop(
         debug!(url = %ws_url, service_id, initial_ping_secs, "Connecting to Lark WebSocket");
 
         match connect_and_listen(
+            platform,
             ws_url,
             service_id,
             initial_ping_secs,
@@ -336,6 +355,7 @@ async fn ws_loop(
 
 /// Connect to the WebSocket and listen for binary protobuf frames.
 async fn connect_and_listen(
+    platform: PluginType,
     ws_url: &str,
     service_id: i32,
     initial_ping_secs: u64,
@@ -401,7 +421,7 @@ async fn connect_and_listen(
                                     let msg_type = get_header(&frame.headers, "type").unwrap_or("");
                                     if msg_type == "event" || msg_type == "card" {
                                         if let Ok(text) = String::from_utf8(merged) {
-                                            handle_ws_text(&text, msg_type, message_tx, confirm_tx, dedup_cache).await;
+                                            handle_ws_text(platform, &text, msg_type, message_tx, confirm_tx, dedup_cache).await;
                                         } else {
                                             warn!("Lark frame payload is not valid UTF-8");
                                         }
@@ -475,6 +495,7 @@ fn handle_control_frame(frame: &super::frame::PbFrame) -> Option<Duration> {
 
 /// Handle a decoded and reassembled Lark event payload.
 async fn handle_ws_text(
+    platform: PluginType,
     text: &str,
     frame_type: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
@@ -511,12 +532,12 @@ async fn handle_ws_text(
             match event_type {
                 "im.message.receive_v1" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
-                        handle_message_event(event_data, message_tx).await;
+                        handle_message_event(platform, event_data, message_tx).await;
                     }
                 }
                 "application.bot.menu_v6" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
-                        handle_bot_menu_event(event_data, message_tx).await;
+                        handle_bot_menu_event(platform, event_data, message_tx).await;
                     }
                 }
                 _ => {
@@ -532,7 +553,7 @@ async fn handle_ws_text(
                     return;
                 }
             };
-            handle_card_action(data, message_tx, confirm_tx).await;
+            handle_card_action(platform, data, message_tx, confirm_tx).await;
         }
         _ => {
             debug!(frame_type, "Lark unhandled payload type");
@@ -545,7 +566,11 @@ async fn handle_ws_text(
 // ---------------------------------------------------------------------------
 
 /// Handle an `im.message.receive_v1` event.
-async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_message_event(
+    platform: PluginType,
+    event_data: serde_json::Value,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+) {
     let evt: MessageEvent = match serde_json::from_value(event_data.clone()) {
         Ok(e) => e,
         Err(e) => {
@@ -578,7 +603,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
         id: evt.message.message_id.clone(),
-        platform: PluginType::Lark,
+        platform,
         chat_id: evt.message.chat_id.clone(),
         user,
         content: UnifiedMessageContent {
@@ -597,6 +622,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
 
 /// Handle a `card.action.trigger` event.
 async fn handle_card_action(
+    platform: PluginType,
     data: serde_json::Value,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
@@ -654,7 +680,7 @@ async fn handle_card_action(
             category,
             params,
             context: ActionContext {
-                platform: PluginType::Lark,
+                platform,
                 user_id: evt.operator.open_id.clone(),
                 chat_id: chat_id.clone(),
                 message_id: message_id.clone(),
@@ -666,7 +692,7 @@ async fn handle_card_action(
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
         id: format!("card_{}", chrono_now()),
-        platform: PluginType::Lark,
+        platform,
         chat_id,
         user,
         content: UnifiedMessageContent {
@@ -684,7 +710,11 @@ async fn handle_card_action(
 }
 
 /// Handle an `application.bot.menu_v6` event.
-async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_bot_menu_event(
+    platform: PluginType,
+    event_data: serde_json::Value,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+) {
     let evt: BotMenuEvent = match serde_json::from_value(event_data) {
         Ok(e) => e,
         Err(e) => {
@@ -703,7 +733,7 @@ async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc:
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
         id: format!("menu_{}", chrono_now()),
-        platform: PluginType::Lark,
+        platform,
         chat_id: evt.operator.operator_id.open_id.clone(),
         user,
         content: UnifiedMessageContent {
@@ -1156,7 +1186,15 @@ mod tests {
             }
         }"#;
 
-        handle_ws_text(payload, "event", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(
+            PluginType::Lark,
+            payload,
+            "event",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
 
         let msg = message_rx.try_recv().unwrap();
         assert_eq!(msg.id, "msg_test_1");
@@ -1193,8 +1231,24 @@ mod tests {
             }
         }"#;
 
-        handle_ws_text(payload, "event", &message_tx, &confirm_tx, &dedup_cache).await;
-        handle_ws_text(payload, "event", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(
+            PluginType::Lark,
+            payload,
+            "event",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
+        handle_ws_text(
+            PluginType::Lark,
+            payload,
+            "event",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
 
         assert!(message_rx.try_recv().is_ok());
         assert!(message_rx.try_recv().is_err());
@@ -1213,7 +1267,15 @@ mod tests {
             "open_chat_id": "oc_chat2"
         }"#;
 
-        handle_ws_text(payload, "card", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(
+            PluginType::Lark,
+            payload,
+            "card",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
 
         let msg = message_rx.try_recv().unwrap();
         assert_eq!(msg.chat_id, "oc_chat2");
@@ -1241,7 +1303,15 @@ mod tests {
             "open_chat_id": "oc_1"
         }"#;
 
-        handle_ws_text(payload, "card", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(
+            PluginType::Lark,
+            payload,
+            "card",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
 
         let (call_id, value) = confirm_rx.try_recv().unwrap();
         assert_eq!(call_id, "call_123");
@@ -1254,7 +1324,15 @@ mod tests {
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
         let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
 
-        handle_ws_text("{}", "unknown_type", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(
+            PluginType::Lark,
+            "{}",
+            "unknown_type",
+            &message_tx,
+            &confirm_tx,
+            &dedup_cache,
+        )
+        .await;
 
         assert!(message_rx.try_recv().is_err());
     }

@@ -16,6 +16,10 @@ use std::fmt;
 pub enum PluginType {
     Telegram,
     Lark,
+    /// Lark international platform (open.larksuite.com). Same wire protocol
+    /// as Feishu, but a separate account system and API domain.
+    #[serde(rename = "lark_intl")]
+    LarkIntl,
     Dingtalk,
     Weixin,
     /// Reserved variant for future Slack integration.
@@ -29,6 +33,7 @@ impl fmt::Display for PluginType {
         match self {
             Self::Telegram => write!(f, "telegram"),
             Self::Lark => write!(f, "lark"),
+            Self::LarkIntl => write!(f, "lark_intl"),
             Self::Dingtalk => write!(f, "dingtalk"),
             Self::Weixin => write!(f, "weixin"),
             Self::Slack => write!(f, "slack"),
@@ -43,6 +48,7 @@ impl PluginType {
         match s {
             "telegram" => Some(Self::Telegram),
             "lark" => Some(Self::Lark),
+            "lark_intl" => Some(Self::LarkIntl),
             "dingtalk" => Some(Self::Dingtalk),
             "weixin" => Some(Self::Weixin),
             "slack" => Some(Self::Slack),
@@ -496,6 +502,7 @@ mod tests {
         let cases = [
             (PluginType::Telegram, "\"telegram\""),
             (PluginType::Lark, "\"lark\""),
+            (PluginType::LarkIntl, "\"lark_intl\""),
             (PluginType::Dingtalk, "\"dingtalk\""),
             (PluginType::Weixin, "\"weixin\""),
             (PluginType::Slack, "\"slack\""),
@@ -513,6 +520,7 @@ mod tests {
     fn plugin_type_display() {
         assert_eq!(PluginType::Telegram.to_string(), "telegram");
         assert_eq!(PluginType::Lark.to_string(), "lark");
+        assert_eq!(PluginType::LarkIntl.to_string(), "lark_intl");
         assert_eq!(PluginType::Dingtalk.to_string(), "dingtalk");
         assert_eq!(PluginType::Weixin.to_string(), "weixin");
         assert_eq!(PluginType::Slack.to_string(), "slack");
@@ -523,6 +531,7 @@ mod tests {
     fn plugin_type_from_str_opt() {
         assert_eq!(PluginType::from_str_opt("telegram"), Some(PluginType::Telegram));
         assert_eq!(PluginType::from_str_opt("lark"), Some(PluginType::Lark));
+        assert_eq!(PluginType::from_str_opt("lark_intl"), Some(PluginType::LarkIntl));
         assert_eq!(PluginType::from_str_opt("unknown"), None);
     }
 

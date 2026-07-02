@@ -30,6 +30,9 @@ pub fn create_plugin(plugin_type: PluginType) -> Option<Box<dyn ChannelPlugin>> 
         #[cfg(feature = "lark")]
         PluginType::Lark => Some(Box::new(lark::LarkPlugin::new())),
 
+        #[cfg(feature = "lark")]
+        PluginType::LarkIntl => Some(Box::new(lark::LarkPlugin::new_international())),
+
         #[cfg(feature = "dingtalk")]
         PluginType::Dingtalk => Some(Box::new(dingtalk::DingtalkPlugin::new())),
 

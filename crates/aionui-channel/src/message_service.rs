@@ -378,7 +378,7 @@ pub enum StreamAction {
 fn platform_to_source(platform: PluginType) -> ConversationSource {
     match platform {
         PluginType::Telegram => ConversationSource::Telegram,
-        PluginType::Lark => ConversationSource::Lark,
+        PluginType::Lark | PluginType::LarkIntl => ConversationSource::Lark,
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
         // Reserved variants default to Aionui
@@ -423,7 +423,7 @@ fn channel_conversation_name(
 ) -> String {
     let short = match platform {
         PluginType::Telegram => "tg",
-        PluginType::Lark => "lark",
+        PluginType::Lark | PluginType::LarkIntl => "lark",
         PluginType::Dingtalk => "ding",
         PluginType::Weixin => "wx",
         PluginType::Slack => "slack",
