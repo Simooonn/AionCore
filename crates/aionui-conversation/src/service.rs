@@ -707,6 +707,20 @@ impl ConversationService {
         if let Some(stale) = map.remove(conversation_id) {
             stale.join.abort();
         }
+        // Pending-prompt probe for the orphan-turn idle bound: a Session agent
+        // blocked on an AskUserQuestion / permission request is waiting for the
+        // user, not abandoned. Held as a `Weak` — a strong ref would keep the
+        // agent (and its `runtime.tx`) alive from inside the watcher, so the
+        // watcher could never observe the source closing and never exit.
+        let pending_probe: Option<Arc<dyn Fn() -> usize + Send + Sync>> = match agent {
+            AgentInstance::Session(task) => {
+                let weak = Arc::downgrade(task);
+                Some(Arc::new(move || {
+                    weak.upgrade().map(|task| task.get_confirmations().len()).unwrap_or(0)
+                }))
+            }
+            _ => None,
+        };
         let watcher = crate::background_stream::BackgroundStreamWatcher {
             conversation_id: conversation_id.to_owned(),
             user_id: user_id.to_owned(),
@@ -716,6 +730,8 @@ impl ConversationService {
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
             pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
+            pending_probe,
+            orphan_idle: std::time::Duration::from_millis(crate::background_stream::ORPHAN_TURN_IDLE_MS),
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));

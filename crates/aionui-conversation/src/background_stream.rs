@@ -32,7 +32,7 @@ use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
@@ -43,7 +43,13 @@ use crate::stream_relay::StreamRelay;
 /// An orphan turn with NO frame for this long is presumed abandoned (a stray
 /// content frame with no terminal); the feeder closes and the relay finalizes
 /// with what it has, so the watcher can never be wedged forever.
-const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
+///
+/// Exception: a turn whose agent is blocked on a pending user prompt
+/// (AskUserQuestion / permission request, `pending_probe() > 0`) is waiting
+/// for the USER, not abandoned — it is not closed on idle, however long the
+/// user takes to answer. The answer produces frames again; a dead agent closes
+/// the source instead, so the bound still cannot wedge forever.
+pub(crate) const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
 
 /// How long a `MessageLifecycle{Started}` echo stays armed as "the next
 /// agent-started turn serves a user message" before it is presumed lost.
@@ -74,6 +80,16 @@ pub(crate) struct BackgroundStreamWatcher {
     /// Expiry for a pending `MessageLifecycle{Started}` (see
     /// [`PENDING_STARTED_TTL`]); injectable so tests can use a short bound.
     pub pending_started_ttl: std::time::Duration,
+    /// Live count of pending user-input prompts (AskUserQuestion / permission
+    /// requests) on the agent behind this watcher — the same source the REST
+    /// `/confirmations` recovery path reads. Consulted ONLY when an orphan turn
+    /// goes idle (never per frame): while it is `> 0` the idle close is
+    /// skipped. `None` for instances without pending-prompt bookkeeping
+    /// (title-only ACP managers), treated as 0.
+    pub pending_probe: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Idle bound for an orphan turn (see [`ORPHAN_TURN_IDLE_MS`]);
+    /// injectable so tests can use a short bound.
+    pub orphan_idle: std::time::Duration,
 }
 
 impl BackgroundStreamWatcher {
@@ -426,7 +442,7 @@ impl BackgroundStreamWatcher {
         let mut relay_task = tokio::spawn(relay.consume(feed_rx));
         let _ = feed_tx.send(first);
 
-        let idle = std::time::Duration::from_millis(ORPHAN_TURN_IDLE_MS);
+        let idle = self.orphan_idle;
         let outcome = loop {
             tokio::select! {
                 joined = &mut relay_task => break joined,
@@ -451,9 +467,29 @@ impl BackgroundStreamWatcher {
                         }
                         let _ = feed_tx.send(ev);
                     }
-                    // Source closed (instance torn down) or idle too long: close
-                    // the feed so the relay finalizes with what it has.
-                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    // Source closed (instance torn down): close the feed so the
+                    // relay finalizes with what it has.
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        drop(feed_tx);
+                        break relay_task.await;
+                    }
+                    // Idle too long. An agent blocked on a pending
+                    // AskUserQuestion / permission prompt is waiting for the
+                    // USER, not abandoned — keep the turn open until the prompt
+                    // resolves. Live 2026-10-10: every unanswered question got
+                    // its turn closed at exactly +180s, the waiting marker
+                    // vanished, and the idle scan later killed the process.
+                    Err(_elapsed) => {
+                        let pending = self.pending_probe.as_ref().map(|probe| probe()).unwrap_or(0);
+                        if pending > 0 {
+                            debug!(
+                                conversation_id = %self.conversation_id,
+                                turn_id = %turn_id,
+                                pending,
+                                "background stream: orphan turn idle but agent awaits user input; keep feeding"
+                            );
+                            continue;
+                        }
                         drop(feed_tx);
                         break relay_task.await;
                     }
@@ -527,15 +563,26 @@ mod tests {
         _watcher: tokio::task::JoinHandle<()>,
     }
 
+    type PendingProbe = Arc<dyn Fn() -> usize + Send + Sync>;
+
+    fn default_orphan_idle() -> std::time::Duration {
+        std::time::Duration::from_millis(ORPHAN_TURN_IDLE_MS)
+    }
+
     async fn rig() -> Rig {
-        rig_with_opts(false, PENDING_STARTED_TTL).await
+        rig_with_opts(false, PENDING_STARTED_TTL, default_orphan_idle(), None).await
     }
 
     async fn rig_with(title_only: bool) -> Rig {
-        rig_with_opts(title_only, PENDING_STARTED_TTL).await
+        rig_with_opts(title_only, PENDING_STARTED_TTL, default_orphan_idle(), None).await
     }
 
-    async fn rig_with_opts(title_only: bool, pending_started_ttl: std::time::Duration) -> Rig {
+    async fn rig_with_opts(
+        title_only: bool,
+        pending_started_ttl: std::time::Duration,
+        orphan_idle: std::time::Duration,
+        pending_probe: Option<PendingProbe>,
+    ) -> Rig {
         let db = init_database_memory().await.unwrap();
         let user_repo = SqliteUserRepository::new(db.pool().clone());
         let user = user_repo.create_user("user-1", "hash").await.unwrap();
@@ -572,6 +619,8 @@ mod tests {
             runtime_state: Arc::clone(&runtime_state),
             title_only,
             pending_started_ttl,
+            pending_probe,
+            orphan_idle,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {
@@ -686,6 +735,157 @@ mod tests {
         }
         assert!(kinds.contains(&"tool_call".to_owned()), "got {kinds:?}");
         assert!(kinds.contains(&"tool_group".to_owned()), "got {kinds:?}");
+    }
+
+    fn ask_frame() -> AgentStreamEvent {
+        AgentStreamEvent::Ask(serde_json::json!({
+            "session_id": "conv-1",
+            "request_id": "req-1",
+            "questions": [{
+                "question": "Proceed?",
+                "header": "Plan",
+                "options": [{"label": "Yes"}, {"label": "No"}]
+            }]
+        }))
+    }
+
+    fn probe_of(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Option<PendingProbe> {
+        let counter = Arc::clone(counter);
+        Some(Arc::new(move || counter.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    /// Drain the live bus for up to `$ms` and report whether `turn.completed`
+    /// arrived (the orphan relay's book-keeping terminal, whatever its kind).
+    macro_rules! saw_turn_completed_within {
+        ($ws:expr, $ms:expr) => {{
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis($ms);
+            let mut seen = false;
+            while tokio::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left, $ws.recv()).await {
+                    Ok(Ok(evt)) => {
+                        if evt.name == "turn.completed" {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+            seen
+        }};
+    }
+
+    /// The stuck-question bug (live 2026-10-10): claude raised an
+    /// AskUserQuestion inside a CLI-initiated turn and then went silent waiting
+    /// for the user; the orphan idle bound closed the turn at +180s, the
+    /// waiting marker vanished, and the idle scan later killed the process.
+    /// A pending prompt must keep the turn open — even when the Ask is the very
+    /// FIRST frame (fed via `feed_tx.send(first)`, outside the frame loop) —
+    /// and the idle bound resumes once the prompt resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphan_turn_idle_with_pending_prompt_stays_open_until_prompt_resolves() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let rig = rig_with_opts(
+            false,
+            PENDING_STARTED_TTL,
+            std::time::Duration::from_millis(50),
+            probe_of(&pending),
+        )
+        .await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx.send(ask_frame()).unwrap();
+
+        assert!(
+            !saw_turn_completed_within!(ws, 400),
+            "a pending user prompt must keep the orphan turn open past the idle bound"
+        );
+
+        pending.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            saw_turn_completed_within!(ws, 1500),
+            "once the prompt resolves the idle bound closes the turn again"
+        );
+    }
+
+    /// Progress-card heartbeats (1s `WorkflowProgress` ticks while a background
+    /// card is open) flow INSIDE the orphan turn. They must neither close the
+    /// turn nor defeat the pending-prompt protection once they stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphan_turn_heartbeats_then_silence_with_pending_prompt_stays_open() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let rig = rig_with_opts(
+            false,
+            PENDING_STARTED_TTL,
+            std::time::Duration::from_millis(50),
+            probe_of(&pending),
+        )
+        .await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "Checking before I ask…".into(),
+            }))
+            .unwrap();
+        rig.tx.send(ask_frame()).unwrap();
+        for _ in 0..5 {
+            rig.tx
+                .send(settled_card_with("toolu_bg", ToolCallStatus::Running))
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !saw_turn_completed_within!(ws, 400),
+            "heartbeats followed by silence must not close a turn that awaits user input"
+        );
+    }
+
+    /// Without a pending prompt the idle bound behaves exactly as before: a
+    /// stray content frame with no terminal is finalized once the bound elapses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphan_turn_idle_without_pending_prompt_closes_as_before() {
+        let rig = rig_with_opts(false, PENDING_STARTED_TTL, std::time::Duration::from_millis(50), None).await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "stray content with no terminal".into(),
+            }))
+            .unwrap();
+
+        assert!(
+            saw_turn_completed_within!(ws, 1500),
+            "an idle orphan turn with nothing pending is finalized by the idle bound"
+        );
+        let row = eventually(async || rows_of_type(&rig, "text").await.into_iter().next())
+            .await
+            .expect("the relay finalizes with what it has");
+        assert!(row.content.contains("stray content"), "stored: {}", row.content);
+    }
+
+    /// A pending prompt never blocks a REAL terminal: Finish still completes
+    /// the turn immediately, probe or not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphan_turn_finish_with_pending_prompt_still_completes() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let rig = rig_with_opts(
+            false,
+            PENDING_STARTED_TTL,
+            std::time::Duration::from_millis(50),
+            probe_of(&pending),
+        )
+        .await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx.send(ask_frame()).unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        assert!(
+            saw_turn_completed_within!(ws, 1500),
+            "Finish must complete the turn even while a prompt is pending"
+        );
     }
 
     /// The dead-conversation bug: after a background task completes, the CLI
@@ -982,7 +1182,7 @@ mod tests {
     /// exec (#758's regression).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_started_without_terminal_echo_does_not_claim_a_later_turn() {
-        let rig = rig_with_opts(false, std::time::Duration::from_millis(50)).await;
+        let rig = rig_with_opts(false, std::time::Duration::from_millis(50), default_orphan_idle(), None).await;
         rig.tx
             .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
                 client_msg_id: "cmsg-lost".into(),
