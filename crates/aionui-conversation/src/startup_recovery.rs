@@ -1,6 +1,6 @@
 use aionui_common::ErrorChain;
-use aionui_db::MessageRowUpdate;
 use aionui_db::models::MessageRow;
+use aionui_db::{MessagePageDirection, MessagePageParams, MessageRowUpdate};
 use tracing::{info, warn};
 
 use crate::runtime_persistence::RuntimeWriteKind;
@@ -52,7 +52,16 @@ impl ConversationService {
                 continue;
             }
 
-            let action = classify_recovery_action(&row);
+            let mut action = classify_recovery_action(&row);
+            if action == StartupRecoveryAction::KeepPendingUserPrompt
+                && self.has_user_message_after(&stale.user_id, &row).await
+            {
+                // The user already moved on (answered by message / asked something
+                // else): the prompt is no longer owed, so settle it like any other
+                // dead tool row — otherwise the View Steps spinner keyed off this
+                // row would survive every restart.
+                action = StartupRecoveryAction::SettleToolRow;
+            }
             if action == StartupRecoveryAction::KeepPendingUserPrompt {
                 info!(
                     conversation_id = %row.conversation_id,
@@ -101,6 +110,33 @@ impl ConversationService {
 
         if recovered > 0 {
             info!(recovered, "startup recovery completed for stale runtime messages");
+        }
+    }
+
+    /// Is there a user (`position = right`) message newer than `row`? Looks at
+    /// the latest page only — a prompt buried deeper than that is long past.
+    async fn has_user_message_after(&self, user_id: &str, row: &MessageRow) -> bool {
+        let params = MessagePageParams {
+            limit: 200,
+            direction: MessagePageDirection::InitialLatest,
+        };
+        match self
+            .conversation_repo()
+            .list_messages_page(user_id, &row.conversation_id, &params)
+            .await
+        {
+            Ok(page) => page
+                .items
+                .iter()
+                .any(|m| m.position.as_deref() == Some("right") && m.created_at > row.created_at),
+            Err(error) => {
+                warn!(
+                    conversation_id = %row.conversation_id,
+                    error = %ErrorChain(&error),
+                    "startup recovery could not check for a later user message; keeping the prompt"
+                );
+                false
+            }
         }
     }
 }
