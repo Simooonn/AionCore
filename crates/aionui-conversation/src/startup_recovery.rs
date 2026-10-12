@@ -18,6 +18,15 @@ enum StartupRecoveryAction {
     /// embedded status, and `hasRunningToolMessages` would keep the View Steps
     /// spinner alive off a `finish` row whose content still says running.
     SettleToolRow,
+    /// A `tool_call` row for an AskUserQuestion the user never answered. Unlike
+    /// a dead Bash/edit call it is NOT dead by definition: the question is still
+    /// askable — the frontend derives a question card from this row and resends
+    /// the answer as a message (the CLI's own resume marks the dangling tool_use
+    /// as interrupted and reads the message). Settling it to `canceled` would
+    /// erase the only record that the user still owes an answer (live
+    /// 2026-10-12: every restart turned the stuck question into a dead row).
+    /// Left exactly as persisted.
+    KeepPendingUserPrompt,
 }
 
 impl ConversationService {
@@ -44,6 +53,16 @@ impl ConversationService {
             }
 
             let action = classify_recovery_action(&row);
+            if action == StartupRecoveryAction::KeepPendingUserPrompt {
+                info!(
+                    conversation_id = %row.conversation_id,
+                    msg_id = ?row.msg_id,
+                    message_type = %row.r#type,
+                    recovery_action = ?action,
+                    "startup recovery kept a pending user prompt"
+                );
+                continue;
+            }
             let content = match action {
                 StartupRecoveryAction::SettleToolRow => settle_tool_row_content(&row.r#type, &row.content),
                 _ => None,
@@ -87,6 +106,9 @@ impl ConversationService {
 }
 
 fn classify_recovery_action(row: &MessageRow) -> StartupRecoveryAction {
+    if row.r#type == "tool_call" && is_pending_user_prompt(&row.content) {
+        return StartupRecoveryAction::KeepPendingUserPrompt;
+    }
     if matches!(row.r#type.as_str(), "tool_call" | "tool_group") {
         return StartupRecoveryAction::SettleToolRow;
     }
@@ -134,6 +156,19 @@ fn settle_tool_row_content(row_type: &str, content: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// An AskUserQuestion `tool_call` whose embedded status is still non-terminal:
+/// the user never answered it. Unparsable content is never a prompt.
+fn is_pending_user_prompt(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    value.get("name").and_then(|name| name.as_str()) == Some("AskUserQuestion")
+        && value
+            .get("status")
+            .and_then(|status| status.as_str())
+            .is_none_or(|status| !matches!(status, "completed" | "error" | "canceled"))
 }
 
 fn message_has_visible_content(row: &MessageRow) -> bool {
@@ -191,6 +226,56 @@ mod tests {
             };
             assert_eq!(classify_recovery_action(&row), StartupRecoveryAction::SettleToolRow);
         }
+    }
+
+    fn tool_row(name: &str, status: &str) -> MessageRow {
+        MessageRow {
+            id: "m".into(),
+            conversation_id: "c".into(),
+            msg_id: Some("m".into()),
+            r#type: "tool_call".into(),
+            content: serde_json::json!({
+                "call_id": "m",
+                "name": name,
+                "args": {"questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]},
+                "status": status
+            })
+            .to_string(),
+            position: Some("left".into()),
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        }
+    }
+
+    /// The stuck-question residue (live 2026-10-12): an unanswered
+    /// AskUserQuestion is a pending user prompt, not a dead tool call — it must
+    /// survive startup untouched so the frontend can still derive its card.
+    #[test]
+    fn pending_ask_user_question_rows_are_kept() {
+        let row = tool_row("AskUserQuestion", "running");
+        assert_eq!(
+            classify_recovery_action(&row),
+            StartupRecoveryAction::KeepPendingUserPrompt
+        );
+        assert!(is_pending_user_prompt(&row.content));
+    }
+
+    #[test]
+    fn answered_ask_user_question_rows_still_settle() {
+        for status in ["completed", "error", "canceled"] {
+            let row = tool_row("AskUserQuestion", status);
+            assert_eq!(classify_recovery_action(&row), StartupRecoveryAction::SettleToolRow);
+            assert!(!is_pending_user_prompt(&row.content));
+        }
+    }
+
+    #[test]
+    fn other_running_tool_rows_still_settle() {
+        let row = tool_row("Bash", "running");
+        assert_eq!(classify_recovery_action(&row), StartupRecoveryAction::SettleToolRow);
+        assert!(!is_pending_user_prompt("not json"));
     }
 
     /// The hard-kill residue (audit 2026-08-04): rows whose CONTENT still says
