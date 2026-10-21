@@ -427,7 +427,12 @@ pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
     }
 
     let trimmed = raw_base_url.trim_end_matches('/');
-    let base_url = Some(trimmed.to_owned()).filter(|u| !u.is_empty());
+    let normalized = if platform == NEW_API_PLATFORM {
+        normalize_new_api_base_url(trimmed, mapped_provider)
+    } else {
+        trimmed.to_owned()
+    };
+    let base_url = Some(normalized).filter(|u| !u.is_empty());
 
     match mapped_provider {
         "openai" if base_url.is_some() => {
@@ -527,6 +532,34 @@ fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Resu
     match map.get(model_id) {
         Some(Value::String(protocol)) if !protocol.is_empty() => Ok(protocol.clone()),
         _ => Ok("openai".to_owned()),
+    }
+}
+
+/// Platform identifier for the New API gateway.
+const NEW_API_PLATFORM: &str = "new-api";
+
+/// Re-derive the `/v1` segment of a New API base_url for the target protocol.
+///
+/// A New API gateway serves OpenAI- and Anthropic-shaped models behind one
+/// stored base_url, but the two protocols disagree about the prefix: OpenAI
+/// appends `/chat/completions`, so the prefix must carry `/v1`, while Anthropic
+/// appends `/v1/messages`, so the prefix must stop at the root. Trusting
+/// whichever form the user typed breaks the other protocol, so strip the known
+/// version suffix and add back only what this protocol needs.
+fn normalize_new_api_base_url(trimmed: &str, mapped_provider: &str) -> String {
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let root = trimmed
+        .strip_suffix("/v1")
+        .or_else(|| trimmed.strip_suffix("/v1beta"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+
+    match mapped_provider {
+        "openai" => format!("{root}/v1"),
+        _ => root.to_owned(),
     }
 }
 
@@ -1465,6 +1498,46 @@ mod tests {
                 expected_max_tokens_field: None,
             },
             UrlCompatCase {
+                name: "new-api openai-compatible unversioned prefix gains /v1",
+                platform: "new-api",
+                raw_base_url: "https://host",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: Some("https://host/v1"),
+                expected_api_path: Some("/chat/completions"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "new-api anthropic-compatible prefix drops /v1",
+                platform: "new-api",
+                raw_base_url: "https://host/v1",
+                mapped_provider: "anthropic",
+                is_full_url: false,
+                expected_base_url: Some("https://host"),
+                expected_api_path: Some("/v1/messages"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "new-api anthropic-compatible unversioned prefix is preserved",
+                platform: "new-api",
+                raw_base_url: "https://host",
+                mapped_provider: "anthropic",
+                is_full_url: false,
+                expected_base_url: Some("https://host"),
+                expected_api_path: Some("/v1/messages"),
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
+                name: "new-api empty base url stays empty",
+                platform: "new-api",
+                raw_base_url: "",
+                mapped_provider: "openai",
+                is_full_url: false,
+                expected_base_url: None,
+                expected_api_path: None,
+                expected_max_tokens_field: None,
+            },
+            UrlCompatCase {
                 name: "local openai-compatible prefix is preserved",
                 platform: "custom",
                 raw_base_url: "http://localhost:11434/v1",
@@ -1881,6 +1954,36 @@ mod tests {
                 "{}",
                 case.name
             );
+        }
+    }
+
+    /// One New API provider row holds a single base_url but mixes OpenAI- and
+    /// Anthropic-protocol models, so both must resolve to a working endpoint
+    /// regardless of whether the user typed the `/v1` suffix.
+    #[test]
+    fn new_api_gateway_serves_both_protocols_from_one_base_url() {
+        let model_protocols = r#"{"gpt-6.1-sol":"openai","claude-opus-5-5":"anthropic"}"#;
+
+        for (model_id, expected_final_url) in [
+            ("gpt-6.1-sol", "https://gateway.example.com/v1/chat/completions"),
+            ("claude-opus-5-5", "https://gateway.example.com/v1/messages"),
+        ] {
+            for raw_base_url in [
+                "https://gateway.example.com",
+                "https://gateway.example.com/",
+                "https://gateway.example.com/v1",
+            ] {
+                let provider = map_aionrs_provider("new-api", model_id, Some(model_protocols)).expect("provider maps");
+                let (base_url, compat) =
+                    resolve_aionrs_url_and_compat("new-api", raw_base_url, &provider, model_id, false);
+                let base_url = base_url.expect("base url resolved");
+
+                assert_eq!(
+                    intended_aionrs_final_url(&provider, &base_url, compat.api_path.as_deref()),
+                    expected_final_url,
+                    "model {model_id} with base_url {raw_base_url}"
+                );
+            }
         }
     }
 
