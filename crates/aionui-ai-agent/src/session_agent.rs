@@ -25,7 +25,7 @@ use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
-use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallImage, ToolCallStatus};
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -2932,6 +2932,7 @@ fn spawn_event_pump(
                     output: Some(acc.clone()),
                     description: None,
                     parent_call_id: None,
+                    image: None,
                 }));
                 continue;
             }
@@ -3141,6 +3142,7 @@ fn spawn_event_pump(
                                     output: None,
                                     description: None,
                                     parent_call_id: None,
+                                    image: None,
                                 }));
                             }
                             tool_output.clear();
@@ -3274,6 +3276,7 @@ fn spawn_event_pump(
                             output: None,
                             description: None,
                             parent_call_id: None,
+                            image: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3968,6 +3971,7 @@ fn update_workflow_cards(
                                 output: None,
                                 description: None,
                                 parent_call_id: None,
+                                image: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4251,6 +4255,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 // Subagent attribution (009 H5): persisted onto the row so the
                 // frontend can group a subagent's steps under its Task call.
                 parent_call_id: parent_tool_use_id,
+                image: None,
             })]
         }
         SessionEvent::ToolResult {
@@ -4261,6 +4266,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             ..
         } => {
             let output = tool_result_text(&content);
+            let image = tool_result_image(&content);
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name: String::new(),
@@ -4274,6 +4280,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 output,
                 description: None,
                 parent_call_id: parent_tool_use_id,
+                image,
             })]
         }
         SessionEvent::TurnResult {
@@ -4587,6 +4594,22 @@ fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
         }
     }
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// The first image file among a tool result's parts (codex `imageGeneration`
+/// reports its `savedPath` as an image-typed `FilePath`). Only parts whose
+/// mime is `image/*` count: fileChange/ACP diff paths carry no mime and must
+/// not be mistaken for a generated image.
+fn tool_result_image(content: &[ToolResultContent]) -> Option<ToolCallImage> {
+    content.iter().find_map(|part| match part {
+        ToolResultContent::FilePath { path, mime: Some(mime), .. } if mime.starts_with("image/") => {
+            Some(ToolCallImage {
+                path: path.clone(),
+                mime_type: Some(mime.clone()),
+            })
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -5430,7 +5453,7 @@ mod build_mapping_tests {
 #[cfg(test)]
 mod translate_tests {
     use super::*;
-    use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+    use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallImage, ToolCallStatus};
     use aionui_session::PermissionKind;
 
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
@@ -5450,6 +5473,72 @@ mod translate_tests {
             Some(AgentStreamEvent::AcpContextUsage(v)) => v,
             other => panic!("expected AcpContextUsage, got {other:?}"),
         }
+    }
+
+    fn tool_result_frame(content: Vec<ToolResultContent>) -> ToolCallEventData {
+        let events = translate_event(
+            SessionEvent::ToolResult {
+                tool_use_id: "exec-1".into(),
+                is_error: false,
+                content,
+                parent_tool_use_id: None,
+            },
+            "conv-1",
+            false,
+        );
+        match events.into_iter().next() {
+            Some(AgentStreamEvent::ToolCall(data)) => data,
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    /// codex imageGeneration's `savedPath` arrives as an image-typed FilePath;
+    /// it must reach the frame as `image`, not vanish (the old text-only flatten
+    /// dropped it, so the persisted row had no way to show the picture).
+    #[test]
+    fn tool_result_image_file_reaches_the_frame() {
+        let data = tool_result_frame(vec![ToolResultContent::FilePath {
+            path: "/w/gen.png".into(),
+            mime: Some("image/png".into()),
+            old_text: None,
+            new_text: None,
+        }]);
+        assert_eq!(
+            data.image,
+            Some(ToolCallImage {
+                path: "/w/gen.png".into(),
+                mime_type: Some("image/png".into()),
+            })
+        );
+        assert_eq!(data.output, None, "the image path must not leak into the text output");
+    }
+
+    /// fileChange / ACP diff paths carry no mime — they are edits, not images.
+    #[test]
+    fn tool_result_untyped_file_path_is_not_an_image() {
+        let data = tool_result_frame(vec![ToolResultContent::FilePath {
+            path: "/w/src/lib.rs".into(),
+            mime: None,
+            old_text: None,
+            new_text: Some("@@ -1 +1 @@".into()),
+        }]);
+        assert_eq!(data.image, None);
+    }
+
+    #[test]
+    fn tool_result_text_only_keeps_output_and_no_image() {
+        let data = tool_result_frame(vec![ToolResultContent::Text("done".into())]);
+        assert_eq!(data.output.as_deref(), Some("done"));
+        assert_eq!(data.image, None);
+    }
+
+    /// Merge-patch storage: an absent image must not serialize as `null`, or the
+    /// later frames of the same call would erase the stored image.
+    #[test]
+    fn tool_call_frame_without_image_omits_the_key() {
+        let data = tool_result_frame(vec![ToolResultContent::Text("done".into())]);
+        let json = serde_json::to_value(&data).expect("serializes");
+        assert!(json.get("image").is_none(), "no image key expected, got {json}");
     }
 
     /// The indicator needs a denominator: when the backend reports a context
@@ -5523,6 +5612,7 @@ mod translate_tests {
             output: None,
             description: None,
             parent_call_id: None,
+            image: None,
         })
     }
 

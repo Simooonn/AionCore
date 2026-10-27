@@ -98,6 +98,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                     output: None,
                     description: None,
                     parent_call_id: None,
+                    image: None,
                 }));
             }
 

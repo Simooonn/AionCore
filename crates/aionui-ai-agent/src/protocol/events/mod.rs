@@ -316,6 +316,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            image: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -334,6 +335,7 @@ mod tests {
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
             parent_call_id: Some("toolu_task".into()),
+            image: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -354,6 +356,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            image: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert!(json["data"].get("input").is_none());

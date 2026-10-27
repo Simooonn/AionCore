@@ -141,6 +141,7 @@ async fn weixin_flushes_pending_text_before_tool_call() {
             parent_call_id: None,
             input: None,
             output: None,
+            image: None,
         }))
         .unwrap();
     event_tx
@@ -195,6 +196,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
             parent_call_id: None,
             input: None,
             output: None,
+            image: None,
         }))
         .unwrap();
     event_tx
@@ -234,6 +236,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
             parent_call_id: None,
             input: None,
             output: None,
+            image: None,
         }))
         .unwrap();
     event_tx
