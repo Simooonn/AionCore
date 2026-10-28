@@ -1912,6 +1912,34 @@ async fn create_side_branch_backfills_project_binding_when_injected() {
 }
 
 #[tokio::test]
+async fn channel_shaped_workspace_reuses_one_standard_project() {
+    // Channel conversations share `<work_dir>/channels/<Name>`: every create on that
+    // folder must land in the same standard project.
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    let project_service = make_injected_project_service(work_root.path()).await;
+    svc.with_project_service(project_service.clone());
+
+    let channel_dir = work_root.path().join("channels").join("Lark-Intl");
+    std::fs::create_dir_all(&channel_dir).unwrap();
+    let mut project_ids = Vec::new();
+    for _ in 0..2 {
+        let mut req = make_create_req();
+        req.extra = json!({ "workspace": channel_dir.to_string_lossy(), "backend": "claude" });
+        let resp = svc.create("user_1", req).await.unwrap();
+        let row = repo.get("user_1", &resp.id).await.unwrap().unwrap();
+        project_ids.push(row.project_id.expect("channel workspace should bind a project"));
+    }
+
+    assert_eq!(project_ids[0], project_ids[1]);
+    let project = project_service.get_project("user_1", &project_ids[0]).await.unwrap();
+    // Project names come from the canonical (case-folded) URI; the sidebar label is the
+    // workspace path's last segment, which keeps "Lark-Intl".
+    assert_eq!(project.name, "lark-intl");
+    assert_eq!(project.kind, "standard");
+}
+
+#[tokio::test]
 async fn create_without_project_service_leaves_binding_null() {
     // Best-effort contract: no ProjectService injected → binding stays NULL and
     // create still succeeds (the side branch is a pure no-op).

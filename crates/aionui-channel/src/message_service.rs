@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
@@ -9,7 +10,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
-use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
+use crate::constants::{CHANNEL_WORKSPACE_SUBDIR, STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
 use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
@@ -27,6 +28,9 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
+    /// `<work_dir>/channels`: parent of the one shared workspace each channel's
+    /// conversations run in, so the sidebar groups them under one project.
+    channel_workspace_root: PathBuf,
 }
 
 impl ChannelMessageService {
@@ -34,11 +38,13 @@ impl ChannelMessageService {
         conversation_svc: Arc<ConversationService>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         settings: Arc<ChannelSettingsService>,
+        work_dir: PathBuf,
     ) -> Self {
         Self {
             conversation_svc,
             task_manager,
             settings,
+            channel_workspace_root: work_dir.join(CHANNEL_WORKSPACE_SUBDIR),
         }
     }
 
@@ -81,6 +87,9 @@ impl ChannelMessageService {
         };
 
         let user_id = owner_user_id;
+        // Self-heal: bound sessions skip creation, so recreate the shared channel dir here in case it
+        // was deleted; otherwise warmup rejects the missing custom workspace on every message.
+        let _ = ensure_channel_workspace(&self.channel_workspace_root, platform).await;
         // Channel relays need a stream subscription before the agent starts
         // emitting. `ConversationService::send_message` returns immediately
         // and builds cold agents in the background, so warm the conversation
@@ -169,6 +178,12 @@ impl ChannelMessageService {
             extra["model"] = serde_json::to_value(&model).unwrap_or_default();
             None
         };
+
+        // Every conversation of this channel runs in the same workspace, so the
+        // sidebar (which groups by workspace) shows them under one project.
+        if let Some(dir) = ensure_channel_workspace(&self.channel_workspace_root, platform).await {
+            extra["workspace"] = serde_json::Value::String(dir.to_string_lossy().into_owned());
+        }
 
         let req = CreateConversationRequest {
             r#type: if assistant_id.is_some() { None } else { Some(agent_type) },
@@ -386,6 +401,38 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
     }
 }
 
+/// Fixed, ASCII, display-name-independent directory name for a channel's shared workspace.
+/// Exhaustive on purpose: a new `PluginType` must pick its directory name explicitly.
+fn channel_workspace_dir_name(platform: PluginType) -> &'static str {
+    match platform {
+        PluginType::Telegram => "Telegram",
+        PluginType::Lark => "Lark",
+        PluginType::LarkIntl => "Lark-Intl",
+        PluginType::Dingtalk => "DingTalk",
+        PluginType::Weixin => "WeChat",
+        PluginType::Slack => "Slack",
+        PluginType::Discord => "Discord",
+    }
+}
+
+/// Ensures `<root>/<channel dir>` exists. Returns `None` (logged at warn) on failure so the
+/// caller falls back to the per-conversation temp workspace instead of failing the reply.
+async fn ensure_channel_workspace(root: &Path, platform: PluginType) -> Option<PathBuf> {
+    let dir = root.join(channel_workspace_dir_name(platform));
+    match tokio::fs::create_dir_all(&dir).await {
+        Ok(()) => Some(dir),
+        Err(err) => {
+            warn!(
+                platform = %platform,
+                path = %dir.display(),
+                error = %err,
+                "channel workspace unavailable; falling back to a temp workspace"
+            );
+            None
+        }
+    }
+}
+
 /// Parses a top-level agent_type string to an AgentType enum.
 ///
 /// Falls back to `AgentType::Acp` for unknown values.
@@ -481,6 +528,57 @@ mod tests {
     fn platform_to_source_reserved_defaults_to_aionui() {
         assert_eq!(platform_to_source(PluginType::Slack), ConversationSource::Aionui);
         assert_eq!(platform_to_source(PluginType::Discord), ConversationSource::Aionui);
+    }
+
+    // ── channel workspace ──────────────────────────────────────────────
+
+    #[test]
+    fn channel_workspace_dir_name_maps_every_plugin_type() {
+        let expected = [
+            (PluginType::Telegram, "Telegram"),
+            (PluginType::Lark, "Lark"),
+            (PluginType::LarkIntl, "Lark-Intl"),
+            (PluginType::Dingtalk, "DingTalk"),
+            (PluginType::Weixin, "WeChat"),
+            (PluginType::Slack, "Slack"),
+            (PluginType::Discord, "Discord"),
+        ];
+        for (platform, name) in expected {
+            assert_eq!(channel_workspace_dir_name(platform), name, "{platform:?}");
+            assert!(name.is_ascii(), "{name} must be ASCII");
+            // A `-temp-` leaf would be classified as a temp session workspace.
+            assert!(!name.contains("-temp-"), "{name} must not look like a temp workspace");
+        }
+        // macOS filesystems are case-insensitive by default, so names must differ ignoring case.
+        let mut folded: Vec<String> = expected.iter().map(|(_, n)| n.to_ascii_lowercase()).collect();
+        folded.sort();
+        folded.dedup();
+        assert_eq!(folded.len(), expected.len());
+    }
+
+    #[tokio::test]
+    async fn ensure_channel_workspace_creates_missing_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let channels = root.path().join(CHANNEL_WORKSPACE_SUBDIR);
+        assert!(!channels.exists());
+
+        let dir = ensure_channel_workspace(&channels, PluginType::LarkIntl).await.unwrap();
+
+        assert_eq!(dir, channels.join("Lark-Intl"));
+        assert!(dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn ensure_channel_workspace_returns_none_when_root_is_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let channels = root.path().join(CHANNEL_WORKSPACE_SUBDIR);
+        std::fs::write(&channels, b"not a dir").unwrap();
+
+        assert!(
+            ensure_channel_workspace(&channels, PluginType::LarkIntl)
+                .await
+                .is_none()
+        );
     }
 
     // ── parse_agent_type ───────────────────────────────────────────────
