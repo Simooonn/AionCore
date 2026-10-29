@@ -540,6 +540,26 @@ async fn handle_ws_text(
                         handle_bot_menu_event(platform, event_data, message_tx).await;
                     }
                 }
+                "card.action.trigger" => {
+                    if let Some(mut event_data) = envelope.get("event").cloned() {
+                        // v2 schema nests open_chat_id / open_message_id under
+                        // event.context; hoist them to the top level so that
+                        // CardActionEvent can deserialize them without a struct
+                        // change.
+                        if let Some(ctx) = event_data.get("context").cloned() {
+                            if let Some(obj) = event_data.as_object_mut() {
+                                for key in ["open_chat_id", "open_message_id"] {
+                                    if obj.get(key).is_none() {
+                                        if let Some(val) = ctx.get(key) {
+                                            obj.insert(key.to_string(), val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        handle_card_action(platform, event_data, message_tx, confirm_tx).await;
+                    }
+                }
                 _ => {
                     debug!(event_type, "Lark unhandled event type");
                 }

@@ -63,12 +63,9 @@ pub fn build_ping_frame(service_id: i32) -> PbFrame {
 }
 
 pub fn build_ack_frame(original: &PbFrame) -> PbFrame {
-    let mut ack_headers = Vec::new();
-    for h in &original.headers {
-        if h.key == "type" || h.key == "message_id" || h.key == "trace_id" {
-            ack_headers.push(h.clone());
-        }
-    }
+    // Copy every header from the original frame so Feishu can route the ack
+    // back via `instance_id` and other routing keys it may be tracking.
+    let mut ack_headers: Vec<PbHeader> = original.headers.clone();
     ack_headers.push(PbHeader {
         key: "biz_rt".into(),
         value: "0".into(),
@@ -255,6 +252,48 @@ mod tests {
         assert!(keys.contains(&"biz_rt"));
         assert!(!keys.contains(&"sum"));
         assert!(!keys.contains(&"seq"));
+    }
+
+    #[test]
+    fn build_ack_frame_preserves_all_headers_including_instance_id() {
+        // Feishu routes the ack via `instance_id`; it must survive round-trip.
+        let original = PbFrame {
+            seq_id: 1,
+            log_id: 2,
+            service: 1,
+            method: METHOD_DATA,
+            headers: vec![
+                PbHeader {
+                    key: "type".into(),
+                    value: "event".into(),
+                },
+                PbHeader {
+                    key: "message_id".into(),
+                    value: "msg_abc".into(),
+                },
+                PbHeader {
+                    key: "trace_id".into(),
+                    value: "tr_xyz".into(),
+                },
+                PbHeader {
+                    key: "instance_id".into(),
+                    value: "inst_42".into(),
+                },
+            ],
+            payload_encoding: String::new(),
+            payload_type: String::new(),
+            payload: Vec::new(),
+            log_id_new: String::new(),
+        };
+        let ack = build_ack_frame(&original);
+        let has_instance_id = ack
+            .headers
+            .iter()
+            .any(|h| h.key == "instance_id" && h.value == "inst_42");
+        assert!(has_instance_id, "instance_id header must be forwarded in ack frame");
+        let has_biz_rt = ack.headers.iter().any(|h| h.key == "biz_rt");
+        assert!(has_biz_rt, "biz_rt timing header must be present");
+        assert_eq!(ack.payload, br#"{"code":200}"#);
     }
 
     #[test]
