@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ack_frame_retains_only_allowed_headers() {
+    fn build_ack_frame_retains_all_original_headers() {
         let original = PbFrame {
             seq_id: 5,
             log_id: 10,
@@ -245,13 +245,16 @@ mod tests {
             log_id_new: String::new(),
         };
         let ack = build_ack_frame(&original);
+        // The ack copies every header so Feishu can route it back via
+        // `instance_id` and other keys it tracks; `biz_rt` is appended.
         let keys: Vec<&str> = ack.headers.iter().map(|h| h.key.as_str()).collect();
         assert!(keys.contains(&"type"));
         assert!(keys.contains(&"message_id"));
         assert!(keys.contains(&"trace_id"));
+        assert!(keys.contains(&"sum"));
+        assert!(keys.contains(&"seq"));
         assert!(keys.contains(&"biz_rt"));
-        assert!(!keys.contains(&"sum"));
-        assert!(!keys.contains(&"seq"));
+        assert_eq!(ack.headers.len(), original.headers.len() + 1);
     }
 
     #[test]
