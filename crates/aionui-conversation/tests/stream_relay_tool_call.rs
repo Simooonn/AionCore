@@ -517,8 +517,5 @@ async fn run_tool_call_preserves_image_through_trailing_frames() {
         content["image"]["path"], "/w/gen.png",
         "image must survive the trailing frame"
     );
-    assert_eq!(
-        content["image"]["mime_type"], "image/png",
-        "mime_type preserved"
-    );
+    assert_eq!(content["image"]["mime_type"], "image/png", "mime_type preserved");
 }

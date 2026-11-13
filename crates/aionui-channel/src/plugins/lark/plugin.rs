@@ -546,14 +546,14 @@ async fn handle_ws_text(
                         // event.context; hoist them to the top level so that
                         // CardActionEvent can deserialize them without a struct
                         // change.
-                        if let Some(ctx) = event_data.get("context").cloned() {
-                            if let Some(obj) = event_data.as_object_mut() {
-                                for key in ["open_chat_id", "open_message_id"] {
-                                    if obj.get(key).is_none() {
-                                        if let Some(val) = ctx.get(key) {
-                                            obj.insert(key.to_string(), val.clone());
-                                        }
-                                    }
+                        if let Some(ctx) = event_data.get("context").cloned()
+                            && let Some(obj) = event_data.as_object_mut()
+                        {
+                            for key in ["open_chat_id", "open_message_id"] {
+                                if obj.get(key).is_none()
+                                    && let Some(val) = ctx.get(key)
+                                {
+                                    obj.insert(key.to_string(), val.clone());
                                 }
                             }
                         }

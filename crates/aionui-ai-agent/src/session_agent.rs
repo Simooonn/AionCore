@@ -4627,12 +4627,12 @@ fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
 /// not be mistaken for a generated image.
 fn tool_result_image(content: &[ToolResultContent]) -> Option<ToolCallImage> {
     content.iter().find_map(|part| match part {
-        ToolResultContent::FilePath { path, mime: Some(mime), .. } if mime.starts_with("image/") => {
-            Some(ToolCallImage {
-                path: path.clone(),
-                mime_type: Some(mime.clone()),
-            })
-        }
+        ToolResultContent::FilePath {
+            path, mime: Some(mime), ..
+        } if mime.starts_with("image/") => Some(ToolCallImage {
+            path: path.clone(),
+            mime_type: Some(mime.clone()),
+        }),
         _ => None,
     })
 }
