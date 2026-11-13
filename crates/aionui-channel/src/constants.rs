@@ -25,6 +25,13 @@ pub const STREAM_THROTTLE_INTERVAL: Duration = Duration::from_millis(500);
 pub const TOOL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
+// Workspace
+// ---------------------------------------------------------------------------
+
+/// Subdirectory of the app work dir that holds one shared workspace per channel.
+pub const CHANNEL_WORKSPACE_SUBDIR: &str = "channels";
+
+// ---------------------------------------------------------------------------
 // Platform message limits
 // ---------------------------------------------------------------------------
 

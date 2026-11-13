@@ -147,9 +147,10 @@ async fn get_plugin_status(
         .map(|plugin| (plugin.id.clone(), plugin))
         .collect();
 
-    let builtin_names: [(&str, &str); 7] = [
+    let builtin_names: [(&str, &str); 8] = [
         ("telegram", "Telegram"),
         ("lark", "Lark"),
+        ("lark_intl", "Lark (International)"),
         ("dingtalk", "DingTalk"),
         ("slack", "Slack"),
         ("discord", "Discord"),
@@ -733,7 +734,7 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
     };
 
     match req.plugin_id.as_str() {
-        "lark" => {
+        "lark" | "lark_intl" => {
             if let Some(ref extra) = req.extra_config {
                 credentials.app_id = extra.app_id.clone();
                 credentials.app_secret = extra.app_secret.clone();

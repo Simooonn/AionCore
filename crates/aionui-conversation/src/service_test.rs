@@ -583,7 +583,8 @@ impl IConversationRepository for MockRepo {
             .filter(|message| {
                 message.position.as_deref() == Some("left")
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
-                    && matches!(message.r#type.as_str(), "text" | "thinking")
+                    // Mirrors the sqlite query (sqlite_conversation.rs list_stale_runtime_messages).
+                    && matches!(message.r#type.as_str(), "text" | "thinking" | "tool_call" | "tool_group")
             })
             .filter_map(|message| {
                 let user_id = rows
@@ -1908,6 +1909,34 @@ async fn create_side_branch_backfills_project_binding_when_injected() {
     assert!(row.folder_id.is_some(), "create side branch should backfill folder_id");
     // The transitional workspace string must be untouched by the side branch.
     assert_eq!(resp.extra["workspace"], ws.path().to_string_lossy().as_ref());
+}
+
+#[tokio::test]
+async fn channel_shaped_workspace_reuses_one_standard_project() {
+    // Channel conversations share `<work_dir>/channels/<Name>`: every create on that
+    // folder must land in the same standard project.
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    let project_service = make_injected_project_service(work_root.path()).await;
+    svc.with_project_service(project_service.clone());
+
+    let channel_dir = work_root.path().join("channels").join("Lark-Intl");
+    std::fs::create_dir_all(&channel_dir).unwrap();
+    let mut project_ids = Vec::new();
+    for _ in 0..2 {
+        let mut req = make_create_req();
+        req.extra = json!({ "workspace": channel_dir.to_string_lossy(), "backend": "claude" });
+        let resp = svc.create("user_1", req).await.unwrap();
+        let row = repo.get("user_1", &resp.id).await.unwrap().unwrap();
+        project_ids.push(row.project_id.expect("channel workspace should bind a project"));
+    }
+
+    assert_eq!(project_ids[0], project_ids[1]);
+    let project = project_service.get_project("user_1", &project_ids[0]).await.unwrap();
+    // Project names come from the canonical (case-folded) URI; the sidebar label is the
+    // workspace path's last segment, which keeps "Lark-Intl".
+    assert_eq!(project.name, "lark-intl");
+    assert_eq!(project.kind, "standard");
 }
 
 #[tokio::test]
@@ -6304,6 +6333,98 @@ async fn send_message_persists_factory_resolved_workspace() {
     assert_eq!(updated.extra["workspace"], auto_workspace);
 }
 
+fn ask_user_question_row(conv_id: &str, created_at: i64) -> MessageRow {
+    MessageRow {
+        id: "ask-stale".into(),
+        conversation_id: conv_id.into(),
+        msg_id: Some("ask-stale".into()),
+        r#type: "tool_call".into(),
+        content: json!({
+            "call_id": "ask-stale",
+            "name": "AskUserQuestion",
+            "args": {"questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]},
+            "status": "running"
+        })
+        .to_string(),
+        position: Some("left".into()),
+        status: Some("work".into()),
+        hidden: false,
+        created_at,
+        backend_turn_id: None,
+    }
+}
+
+async fn stale_ask_row(repo: &Arc<MockRepo>, conv_id: &str) -> MessageRow {
+    repo.list_messages_page(
+        "user_1",
+        conv_id,
+        &MessagePageParams {
+            limit: 100,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+    .into_iter()
+    .find(|m| m.id == "ask-stale")
+    .expect("the AskUserQuestion row still exists")
+}
+
+/// An unanswered AskUserQuestion survives startup untouched (the frontend
+/// derives its card from this row).
+#[tokio::test]
+async fn startup_recovery_keeps_an_unanswered_ask_user_question() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message("user_1", &ask_user_question_row(&conv.id, 10))
+        .await
+        .unwrap();
+
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    let row = stale_ask_row(&repo, &conv.id).await;
+    assert_eq!(row.status.as_deref(), Some("work"));
+    let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
+    assert_eq!(content["status"], "running");
+}
+
+/// Once the user moved on (a later user message — the resent answer or a new
+/// request), the prompt is no longer owed and settles like any dead tool row,
+/// so the View Steps spinner keyed off it does not survive the restart.
+#[tokio::test]
+async fn startup_recovery_settles_an_ask_user_question_followed_by_a_user_message() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message("user_1", &ask_user_question_row(&conv.id, 10))
+        .await
+        .unwrap();
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "user-reply".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("user-reply".into()),
+            r#type: "text".into(),
+            content: json!({ "content": "对上一个问题的回答：「下一步」：A 继续" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 20,
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.recover_stale_runtime_state_on_startup().await;
+
+    let row = stale_ask_row(&repo, &conv.id).await;
+    assert_eq!(row.status.as_deref(), Some("finish"));
+    let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
+    assert_eq!(content["status"], "canceled");
+}
+
 #[tokio::test]
 async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
@@ -6805,6 +6926,7 @@ async fn send_message_does_not_auto_replay_after_tool_side_effect() {
                 output: None,
                 description: None,
                 parent_call_id: None,
+                image: None,
             }),
             AgentStreamEvent::Error(ErrorEventData {
                 message: "temporary provider failure".into(),

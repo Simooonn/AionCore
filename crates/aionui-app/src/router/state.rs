@@ -739,6 +739,7 @@ async fn build_channel_message_service(
         Arc::new(services.conversation_service.clone()),
         services.worker_task_manager.clone(),
         channel_settings,
+        services.work_dir.clone(),
     ))
 }
 

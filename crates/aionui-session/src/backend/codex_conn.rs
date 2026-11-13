@@ -3245,9 +3245,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 if item_type == "imageGeneration"
                     && let Some(path) = item.get("savedPath").and_then(Value::as_str)
                 {
+                    // The mime marks this path as an image so the agent layer can
+                    // surface it as a preview (fileChange paths stay mime-less).
                     content.push(crate::event::ToolResultContent::FilePath {
                         path: path.to_string(),
-                        mime: None,
+                        mime: image_mime_for_path(path).map(str::to_string),
                         old_text: None,
                         new_text: None,
                     });
@@ -3396,6 +3398,19 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
 
 /// Map a codex item `type` → the canonical `ItemKind` for the partial-lifecycle
 /// bracket (GAP-E).
+/// Image mime type from a generated file's extension; `None` when it is not a
+/// raster format codex writes.
+fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
 fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
     use crate::event::ItemKind;
     match item_type {
@@ -9508,8 +9523,9 @@ mod tests {
             .collect();
         assert!(
             content.iter().any(|c| matches!(c,
-                crate::event::ToolResultContent::FilePath { path, .. } if path == "/w/generated.png")),
-            "imageGeneration savedPath must reach a FilePath ToolResultContent, got {content:?}"
+                crate::event::ToolResultContent::FilePath { path, mime: Some(mime), .. }
+                    if path == "/w/generated.png" && mime == "image/png")),
+            "imageGeneration savedPath must reach an image-typed FilePath ToolResultContent, got {content:?}"
         );
         assert!(
             !content.iter().any(|c| matches!(c,

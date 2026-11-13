@@ -59,14 +59,17 @@ impl SkillResolver for NoopSkillResolver {
 
 struct ScriptedAgent {
     conversation_id: String,
+    /// The workspace the agent was built with, reported back like a real agent's cwd.
+    workspace: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
 }
 
 impl ScriptedAgent {
-    fn new(conversation_id: &str) -> Self {
+    fn new(conversation_id: &str, workspace: &str) -> Self {
         let (event_tx, _) = broadcast::channel(16);
         Self {
             conversation_id: conversation_id.to_owned(),
+            workspace: workspace.to_owned(),
             event_tx,
         }
     }
@@ -83,7 +86,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/aionui-channel-test"
+        &self.workspace
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -135,14 +138,17 @@ impl IWorkerTaskManager for RecordingTaskManager {
     async fn get_or_build_task(
         &self,
         conversation_id: &str,
-        _options: BuildTaskOptions,
+        options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
         let mut agents = self.agents.lock().unwrap();
         if let Some(agent) = agents.get(conversation_id) {
             return Ok(agent.clone());
         }
 
-        let agent = AgentInstance::Mock(Arc::new(ScriptedAgent::new(conversation_id)));
+        let agent = AgentInstance::Mock(Arc::new(ScriptedAgent::new(
+            conversation_id,
+            &options.context.workspace.path,
+        )));
         agents.insert(conversation_id.to_owned(), agent.clone());
         Ok(agent)
     }
@@ -215,10 +221,11 @@ fn bare_assistant_definition_params<'a>(
 async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    let work_root = tempfile::tempdir().unwrap();
 
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_svc = Arc::new(ConversationService::new(
-        std::env::temp_dir(),
+        work_root.path().to_path_buf(),
         Arc::new(TestBroadcaster::new()),
         Arc::new(NoopSkillResolver),
         Arc::clone(&task_manager),
@@ -230,7 +237,12 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     let settings = Arc::new(ChannelSettingsService::new(Arc::new(
         SqliteClientPreferenceRepository::new(pool),
     )));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        work_root.path().to_path_buf(),
+    );
 
     let session = AssistantSessionRow {
         id: "session-1".to_owned(),
@@ -266,13 +278,14 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
 async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    let work_root = tempfile::tempdir().unwrap();
 
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
     let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let conversation_svc = Arc::new(ConversationService::new(
-        std::env::temp_dir(),
+        work_root.path().to_path_buf(),
         Arc::new(TestBroadcaster::new()),
         Arc::new(NoopSkillResolver),
         Arc::clone(&task_manager),
@@ -308,7 +321,12 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        work_root.path().to_path_buf(),
+    );
 
     let session = AssistantSessionRow {
         id: "session-assisted".to_owned(),
@@ -356,13 +374,14 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
 async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    let work_root = tempfile::tempdir().unwrap();
 
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
     let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let conversation_svc = Arc::new(ConversationService::new(
-        std::env::temp_dir(),
+        work_root.path().to_path_buf(),
         Arc::new(TestBroadcaster::new()),
         Arc::new(NoopSkillResolver),
         Arc::clone(&task_manager),
@@ -385,7 +404,12 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        work_root.path().to_path_buf(),
+    );
 
     let session = AssistantSessionRow {
         id: "session-assisted-missing".to_owned(),
@@ -413,13 +437,14 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
 async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    let work_root = tempfile::tempdir().unwrap();
 
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
     let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let conversation_svc = Arc::new(ConversationService::new(
-        std::env::temp_dir(),
+        work_root.path().to_path_buf(),
         Arc::new(TestBroadcaster::new()),
         Arc::new(NoopSkillResolver),
         Arc::clone(&task_manager),
@@ -445,7 +470,12 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        work_root.path().to_path_buf(),
+    );
 
     let session = AssistantSessionRow {
         id: "session-assisted-default-aionrs".to_owned(),
@@ -484,13 +514,14 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
 async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    let work_root = tempfile::tempdir().unwrap();
 
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
     let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
     let conversation_repo_trait: Arc<dyn IConversationRepository> = conversation_repo.clone();
     let acp_session_repo = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let conversation_svc = Arc::new(ConversationService::new(
-        std::env::temp_dir(),
+        work_root.path().to_path_buf(),
         Arc::new(TestBroadcaster::new()),
         Arc::new(NoopSkillResolver),
         Arc::clone(&task_manager),
@@ -523,7 +554,12 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(
+        conversation_svc,
+        Arc::clone(&task_manager),
+        settings,
+        work_root.path().to_path_buf(),
+    );
 
     let session = AssistantSessionRow {
         id: "session-assisted-fallback-name".to_owned(),
@@ -547,4 +583,168 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .unwrap()
         .unwrap();
     assert_eq!(conversation.name, "tg-acp-codex-70880480");
+}
+
+// ── Per-channel shared workspace ───────────────────────────────────────
+
+/// Bare-aionrs channel wiring with one shared work root for both services, as in production.
+struct ChannelWorkspaceFixture {
+    work_root: tempfile::TempDir,
+    conversation_svc: Arc<ConversationService>,
+    message_svc: ChannelMessageService,
+}
+
+impl ChannelWorkspaceFixture {
+    async fn new() -> Self {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        // Keep the in-memory pool alive for the whole test.
+        std::mem::forget(db);
+        let work_root = tempfile::tempdir().unwrap();
+
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
+        let conversation_repo: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(pool.clone()));
+        let conversation_svc = Arc::new(ConversationService::new(
+            work_root.path().to_path_buf(),
+            Arc::new(TestBroadcaster::new()),
+            Arc::new(NoopSkillResolver),
+            Arc::clone(&task_manager),
+            conversation_repo,
+            Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+            Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+        ));
+
+        let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+        let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+        let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+        conversation_svc.with_assistant_definition_repo(definition_repo.clone());
+        conversation_svc.with_assistant_state_repo(overlay_repo.clone());
+        conversation_svc.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(pool)));
+        definition_repo
+            .upsert(&bare_assistant_definition_params(
+                "asstdef-channel-aionrs",
+                "bare-aionrs",
+                "aionrs",
+            ))
+            .await
+            .unwrap();
+
+        let settings =
+            Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
+        let message_svc = ChannelMessageService::new(
+            Arc::clone(&conversation_svc),
+            task_manager,
+            settings,
+            work_root.path().to_path_buf(),
+        );
+        Self {
+            work_root,
+            conversation_svc,
+            message_svc,
+        }
+    }
+
+    fn channel_dir(&self) -> std::path::PathBuf {
+        self.work_root.path().join("channels").join("Lark-Intl")
+    }
+
+    async fn send(&self, session: &AssistantSessionRow) -> Result<String, ChannelError> {
+        self.message_svc
+            .send_to_agent(TEST_OWNER_USER_ID, session, "hello", PluginType::LarkIntl)
+            .await
+            .map(|result| result.conversation_id)
+    }
+
+    async fn extra(&self, conversation_id: &str) -> serde_json::Value {
+        self.conversation_svc
+            .get(TEST_OWNER_USER_ID, conversation_id)
+            .await
+            .unwrap()
+            .extra
+    }
+}
+
+fn channel_session(id: &str, conversation_id: Option<String>) -> AssistantSessionRow {
+    AssistantSessionRow {
+        id: id.to_owned(),
+        user_id: "channel-user-intl".to_owned(),
+        agent_type: "aionrs".to_owned(),
+        conversation_id,
+        workspace: None,
+        chat_id: Some(format!("oc_{id}")),
+        created_at: 1,
+        last_activity: 1,
+    }
+}
+
+#[tokio::test]
+async fn channel_conversations_share_the_channel_workspace() {
+    let fx = ChannelWorkspaceFixture::new().await;
+
+    let first = fx.send(&channel_session("s1", None)).await.unwrap();
+    let second = fx.send(&channel_session("s2", None)).await.unwrap();
+    assert_ne!(first, second);
+
+    let expected = fx.channel_dir().to_string_lossy().into_owned();
+    for id in [&first, &second] {
+        let extra = fx.extra(id).await;
+        assert_eq!(extra["workspace"], expected.as_str());
+        assert_eq!(extra["is_temporary_workspace"], false);
+    }
+    assert!(fx.channel_dir().is_dir());
+    // A per-conversation temp workspace would live under `<root>/conversations/...`.
+    assert!(!fx.work_root.path().join("conversations").exists());
+}
+
+#[tokio::test]
+async fn deleting_a_channel_conversation_keeps_the_channel_workspace() {
+    let fx = ChannelWorkspaceFixture::new().await;
+    let first = fx.send(&channel_session("s1", None)).await.unwrap();
+    let second = fx.send(&channel_session("s2", None)).await.unwrap();
+
+    fx.conversation_svc.delete(TEST_OWNER_USER_ID, &first).await.unwrap();
+
+    assert!(fx.channel_dir().is_dir());
+    assert_eq!(
+        fx.extra(&second).await["workspace"],
+        fx.channel_dir().to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn channel_workspace_failure_falls_back_to_temp_workspace() {
+    let fx = ChannelWorkspaceFixture::new().await;
+    std::fs::write(fx.work_root.path().join("channels"), b"not a dir").unwrap();
+
+    let id = fx.send(&channel_session("s1", None)).await.unwrap();
+
+    assert_eq!(fx.extra(&id).await["is_temporary_workspace"], true);
+}
+
+#[tokio::test]
+async fn bound_session_recreates_a_deleted_channel_workspace() {
+    let fx = ChannelWorkspaceFixture::new().await;
+    std::fs::create_dir_all(fx.channel_dir()).unwrap();
+    // `create` never builds an agent, so this conversation's agent is cold.
+    let req: aionui_api_types::CreateConversationRequest = serde_json::from_value(serde_json::json!({
+        "type": "aionrs",
+        "source": "lark",
+        "extra": {
+            "session_mode": "yolo",
+            "workspace": fx.channel_dir().to_string_lossy(),
+        }
+    }))
+    .unwrap();
+    let conversation = fx.conversation_svc.create(TEST_OWNER_USER_ID, req).await.unwrap();
+    std::fs::remove_dir_all(fx.channel_dir()).unwrap();
+
+    // One send only: a second send on a warm agent would skip the workspace check.
+    let id = fx
+        .send(&channel_session("bound", Some(conversation.id.clone())))
+        .await
+        .expect("send must self-heal the channel dir before warmup");
+
+    assert_eq!(id, conversation.id);
+    assert!(fx.channel_dir().is_dir());
 }

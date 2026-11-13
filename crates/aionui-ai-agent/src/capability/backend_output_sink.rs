@@ -77,6 +77,7 @@ impl OutputSink for BackendOutputSink {
             output: None,
             description: None,
             parent_call_id: None,
+            image: None,
         }));
     }
 
@@ -117,6 +118,7 @@ impl OutputSink for BackendOutputSink {
             },
             description: None,
             parent_call_id: None,
+            image: None,
         }));
     }
 

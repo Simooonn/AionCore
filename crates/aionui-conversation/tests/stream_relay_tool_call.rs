@@ -87,6 +87,7 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
         output: None,
         description: None,
         parent_call_id: None,
+        image: None,
     }))
     .unwrap();
     tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -136,6 +137,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         output: Some("src/main.rs".into()),
         description: None,
         parent_call_id: None,
+        image: None,
     }))
     .unwrap();
     tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -147,6 +149,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         output: None,
         description: Some("search files".into()),
         parent_call_id: None,
+        image: None,
     }))
     .unwrap();
     tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -203,6 +206,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
         output: None,
         description: None,
         parent_call_id: None,
+        image: None,
     }))
     .unwrap();
     // The turn was interrupted: the fold layer closes the still-open call as
@@ -216,6 +220,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
         output: None,
         description: None,
         parent_call_id: None,
+        image: None,
     }))
     .unwrap();
     tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -297,6 +302,7 @@ impl IAgentTask for ToolCallAgent {
             output: None,
             description: None,
             parent_call_id: None,
+            image: None,
         }));
         let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
         Ok(())
@@ -413,5 +419,106 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
     assert!(
         messages.items.iter().all(|row| row.r#type != "tool_call"),
         "empty call_id tool_call must not be persisted through run_agent_turn"
+    );
+}
+
+/// The image field rides the completed frame but not the later trailing
+/// frames; merge-patch keeps the first image: `skip_serializing_if` makes
+/// the later frames omit the key, so it is not replaced with null.
+#[tokio::test]
+async fn run_tool_call_preserves_image_through_trailing_frames() {
+    use aionui_ai_agent::protocol::events::tool_call::{ToolCallImage, ToolCallStatus};
+
+    let (repo, _db) = setup_repo().await;
+    let bus = Arc::new(BroadcastEventBus::new(64));
+    let (tx, _) = broadcast::channel(64);
+
+    let relay = StreamRelay::new(
+        "conv-1".into(),
+        "asst-1".into(),
+        "turn-1".into(),
+        "system_default_user".into(),
+        repo.clone(),
+        bus,
+    );
+
+    let rx = tx.subscribe();
+
+    // Running: no image
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "exec-1".into(),
+        name: "imageGen".into(),
+        args: json!({"prompt": "a cat"}),
+        status: ToolCallStatus::Running,
+        input: None,
+        output: None,
+        description: None,
+        parent_call_id: None,
+        image: None,
+    }))
+    .unwrap();
+
+    // Completed: image present
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "exec-1".into(),
+        name: String::new(),
+        args: serde_json::Value::Null,
+        status: ToolCallStatus::Completed,
+        input: None,
+        output: Some("✨ Generated image.png".into()),
+        description: None,
+        parent_call_id: None,
+        image: Some(ToolCallImage {
+            path: "/w/gen.png".into(),
+            mime_type: Some("image/png".into()),
+        }),
+    }))
+    .unwrap();
+
+    // Trailing: image omitted (skip_serializing_if)
+    tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        call_id: "exec-1".into(),
+        name: String::new(),
+        args: serde_json::Value::Null,
+        status: ToolCallStatus::Completed,
+        input: None,
+        output: None,
+        description: None,
+        parent_call_id: None,
+        image: None,
+    }))
+    .unwrap();
+
+    tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+    relay.consume(rx).await;
+
+    let messages = repo
+        .list_messages_page(
+            "system_default_user",
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+
+    let tool_call = messages
+        .items
+        .iter()
+        .find(|row| row.r#type == "tool_call")
+        .expect("must have persisted one tool_call");
+
+    let content: serde_json::Value = serde_json::from_str(&tool_call.content).unwrap();
+    assert_eq!(content["status"], "completed");
+    assert_eq!(
+        content["image"]["path"], "/w/gen.png",
+        "image must survive the trailing frame"
+    );
+    assert_eq!(
+        content["image"]["mime_type"], "image/png",
+        "mime_type preserved"
     );
 }

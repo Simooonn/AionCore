@@ -30,6 +30,20 @@ pub struct ToolCallEventData {
     /// would DELETE the stored attribution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+    /// Image file produced by this call (codex `imageGeneration` → its
+    /// `savedPath`). Kept apart from `output` so the text output keeps its
+    /// meaning. Skipped when `None` (merge-patch: the later frames of the same
+    /// call carry no image, and a null would DELETE the stored one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ToolCallImage>,
+}
+
+/// An image file a tool call produced on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallImage {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

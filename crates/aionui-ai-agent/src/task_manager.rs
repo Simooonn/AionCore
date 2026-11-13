@@ -336,6 +336,27 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                     return None;
                 }
 
+                // An agent blocked on a pending AskUserQuestion / permission
+                // prompt is waiting for the USER, not idle. CLI-initiated turns
+                // (claude continuing after a background task finished) never
+                // advance turn_gen, so `status` stays Finished while the prompt
+                // is open; without this guard the scan killed the process ~10
+                // min after the question and every later answer 404'd
+                // ("No active agent for this conversation"). Same source of
+                // truth as the REST `/confirmations` recovery path.
+                let pending_user_input = agent.get_confirmations().len();
+                if pending_user_input > 0 {
+                    debug!(
+                        conversation_id = %entry.key(),
+                        ?status,
+                        idle_ms,
+                        pending_user_input,
+                        reason = %"PendingUserInput",
+                        "Idle scan: pending user input protects idle agent"
+                    );
+                    return None;
+                }
+
                 if let Some(expires_at) = self.active_leases.active_until(entry.key()) {
                     debug!(
                         conversation_id = %entry.key(),
@@ -392,7 +413,7 @@ mod tests {
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
     use crate::types::{CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
-    use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
+    use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicI64, Ordering};
     use tokio::sync::broadcast;
@@ -408,6 +429,7 @@ mod tests {
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
         live_background_tasks: usize,
+        confirmations: usize,
         killed: Arc<std::sync::atomic::AtomicUsize>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
     }
@@ -422,6 +444,7 @@ mod tests {
                 status,
                 last_activity: AtomicI64::new(now_ms()),
                 live_background_tasks: 0,
+                confirmations: 0,
                 killed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 event_tx,
             }
@@ -444,6 +467,13 @@ mod tests {
 
         fn with_live_background_tasks(mut self, count: usize) -> Self {
             self.live_background_tasks = count;
+            self
+        }
+
+        /// Number of pending confirmations (AskUserQuestion / permission
+        /// prompts) the mock reports via `IMockAgent::get_confirmations`.
+        fn with_confirmations(mut self, count: usize) -> Self {
+            self.confirmations = count;
             self
         }
     }
@@ -486,7 +516,22 @@ mod tests {
         }
     }
 
-    impl IMockAgent for MockAgent {}
+    impl IMockAgent for MockAgent {
+        fn get_confirmations(&self) -> Vec<Confirmation> {
+            (0..self.confirmations)
+                .map(|i| Confirmation {
+                    id: format!("confirm-{i}"),
+                    call_id: format!("confirm-{i}"),
+                    title: None,
+                    action: None,
+                    description: String::new(),
+                    command_type: None,
+                    options: Vec::new(),
+                    questions: None,
+                })
+                .collect()
+        }
+    }
 
     fn make_options(conversation_id: &str) -> BuildTaskOptions {
         BuildTaskOptions::new(AgentSessionContext {
@@ -1008,6 +1053,50 @@ mod tests {
 
         assert!(captured.contains("reason=LiveBackgroundTask"));
         assert!(captured.contains("live_background_tasks=1"));
+    }
+
+    #[test]
+    fn collect_idle_skips_tasks_with_pending_user_input() {
+        let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+        cell.set(managed_instance(mock_instance(
+            MockAgent::new("conv-ask", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 1_200_000)
+                .with_confirmations(1),
+        )))
+        .ok();
+        mgr.tasks.insert("conv-ask".into(), Arc::new(cell));
+
+        let captured = capture_logs(tracing::Level::DEBUG, || {
+            let idle = mgr.collect_idle(300_000);
+            assert!(
+                idle.is_empty(),
+                "pending user input must protect the agent, got {idle:?}"
+            );
+        });
+
+        assert!(captured.contains("reason=PendingUserInput"), "{captured}");
+        assert!(captured.contains("pending_user_input=1"), "{captured}");
+    }
+
+    #[test]
+    fn collect_idle_selects_finished_task_without_pending_user_input() {
+        let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+        cell.set(managed_instance(mock_instance(
+            MockAgent::new("conv-noask", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 1_200_000)
+                .with_confirmations(0),
+        )))
+        .ok();
+        mgr.tasks.insert("conv-noask".into(), Arc::new(cell));
+
+        let idle = mgr.collect_idle(300_000);
+        assert_eq!(idle, vec!["conv-noask".to_string()]);
     }
 
     #[test]

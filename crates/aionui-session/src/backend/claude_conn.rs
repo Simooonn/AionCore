@@ -2112,6 +2112,20 @@ async fn reader_task(
     // G2: redact the stderr tail at the backend boundary so a crash carries a
     // user-facing reason (allowlisted, ≤240 chars) without leaking raw stderr.
     let redacted_summary = crate::adapter::redact_exit_stderr(io.as_ref()).await;
+    // The process is gone (or hung beyond recovery): every outstanding
+    // can_use_tool prompt died with it. Drop them BEFORE announcing Detached so
+    // the REST recovery view stops offering cards nobody can answer and the idle
+    // scan's pending-user-input exemption cannot keep this dead task alive.
+    if let Ok(mut pending) = pending_perms.lock()
+        && !pending.is_empty()
+    {
+        tracing::info!(
+            conversation_id = %session_id,
+            dropped = pending.len(),
+            "claude exited with unanswered prompts; clearing pending permissions"
+        );
+        pending.clear();
+    }
     let cur_gen = turn_gen.load(Ordering::SeqCst);
     let _ = event_tx.send(SessionEnvelope {
         session_id,
@@ -5077,6 +5091,49 @@ mod tests {
         assert!(
             backend.pending_permission_requests().is_empty(),
             "answered permission no longer outstanding"
+        );
+    }
+
+    /// A process that exits with a prompt still open takes the prompt with it:
+    /// nothing can answer it anymore, so the recovery view must not offer it and
+    /// the idle scan's pending-user-input exemption must not keep the dead task.
+    #[tokio::test]
+    async fn pending_permission_requests_clear_when_the_process_exits() {
+        let fixture = concat!(
+            r#"{"type":"control_request","request_id":"req-9","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu-9","input":{"command":"ls"}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::new(
+            fixture,
+            Some(crate::event::ExitStatusLite {
+                code: Some(0),
+                signal: None,
+            }),
+        );
+        fake.release_exit();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        let mut events = backend.events();
+        let (saw_permission, saw_detached) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut saw_permission = false;
+            while let Some(env) = events.next().await {
+                match env.event {
+                    SessionEvent::Permission { ref request_id, .. } if request_id == "req-9" => saw_permission = true,
+                    SessionEvent::Detached { .. } => return (saw_permission, true),
+                    _ => {}
+                }
+            }
+            (saw_permission, false)
+        })
+        .await
+        .unwrap_or((false, false));
+        assert!(saw_permission, "the prompt was registered before the exit");
+        assert!(saw_detached, "the reader announced the exit");
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "an exited process leaves no answerable prompt behind"
         );
     }
 
